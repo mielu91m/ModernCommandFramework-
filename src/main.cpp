@@ -26,7 +26,7 @@ extern "C" __declspec(dllexport) bool SFSEPlugin_Load(const SFSE::LoadInterface*
     spdlog::info("Modern Command Framework v1.0");
     spdlog::info("=====================================");
     
-    SFSE::Init(a_sfse);
+    SFSE::Init(a_sfse, { .trampoline = true, .trampolineSize = 256 });
     
     spdlog::info("MCF: Plugin loaded successfully");
     spdlog::info("MCF: Waiting for command registrations...");

@@ -1,6 +1,12 @@
 #include "PCH.h"
 #include "MCF_API.h"
+#include "REL/Offset2ID.h"
+#include "REL/Trampoline.h"
+#include "REL/ASM.h"
+#include "REL/Utility.h"
+#include "SFSE/API.h"
 #include <algorithm>
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -63,31 +69,169 @@ namespace Util
 
 namespace Commands
 {
+	// Limity – zabezpieczenie przy zmodyfikowanych INI / .bat / innych modach (zawieszki, crash przy additem)
+	static constexpr size_t kMaxCommandLength = 8192;
+	static constexpr size_t kMaxArgsCount = 128;
+	static constexpr size_t kMaxPrintLineLength = 4096;
+	static constexpr size_t kMaxHexFormLength = 32;
+
 	static bool g_hookInstalled = false;
 	static thread_local bool g_inHook = false;
 	static std::mutex g_regLock;
 	static std::unordered_map<std::string, MCF::CommandCallback> g_registrations;
 
-	// Jak w CCF: pobierz referencję z uchwytu
+	// Opcja B: pojedynczy getter (Selected Ref) + slot kontekstu – tylko RVA z IDA, bez REL::ID.
+	// Getter: funkcja wywoływana przed "Selected Actor: %s" / "Selected Ref: %s", zwraca REFR* (RAX) lub void(ctx, NiPointer&).
+	// Kontekst: globalny qword (np. qword_1450455F0 → 0x50455F0), przekazywany w RCX do gettera.
+	static uint32_t g_getSelectedRefRVA = 0x2853E40u;   // getter z IDA (sub przy "Selected Actor")
+	static bool g_getSelectedRefReturnsPtr = true;      // true = getter zwraca REFR* w RAX
+	static uint32_t g_consoleContextSlotRVA = 0x50455F0u;  // slot kontekstu (mov rcx, cs:qword przed call gettera)
+	// Opcja 2 (gdy opcja 1 nie działa): trzy osobne adresy (slot, GetConsoleHandle, LookupRefFromHandle).
+	// 0x5C8E6D8 = RVA qword_145C8E6D8 z IDA (xrefs: 2 zapisy, ~30 odczytów; getter sub_142C54A80).
+	static uint32_t g_consoleRefManagerSlotRVA = 0x5C8E6D8u;  // slot „managera konsoli”
+	static uint32_t g_getConsoleHandleRVA = 0;       // Funkcja void(*)(void* manager, uint32_t* outHandle).
+	static uint32_t g_lookupRefFromHandleRVA = 0;   // Funkcja void(*)(NiPointer<TESObjectREFR>& out, uint32_t* handle).
+
+	static void GetRefrFromHandleImpl(uint32_t handle, RE::NiPointer<RE::TESObjectREFR>& out)
+	{
+		__try {
+			if (g_lookupRefFromHandleRVA != 0) {
+				uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA("Starfield.exe"));
+				auto fn = reinterpret_cast<void(*)(RE::NiPointer<RE::TESObjectREFR>&, uint32_t*)>(base + g_lookupRefFromHandleRVA);
+				if (fn) fn(out, &handle);
+			} else {
+				REL::Relocation<void(RE::NiPointer<RE::TESObjectREFR>&, uint32_t*)> func(REL::ID(72399));
+				func(out, &handle);
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			out.reset();
+		}
+	}
+
 	static RE::NiPointer<RE::TESObjectREFR> GetRefrFromHandle(uint32_t handle)
 	{
 		RE::NiPointer<RE::TESObjectREFR> result;
-		REL::Relocation<void(RE::NiPointer<RE::TESObjectREFR>&, uint32_t*)> func(REL::ID(72399));
-		func(result, &handle);
+		GetRefrFromHandleImpl(handle, result);
 		return result;
 	}
 
-	// Jak w CCF: wskaźnik do managera konsoli pod adresem z REL::ID(879512)
+	// __try w osobnym wrapperze (bez lokalnych obiektow z destruktorem).
+	static void GetConsoleRefrImpl(RE::NiPointer<RE::TESObjectREFR>& out)
+	{
+		out.reset();
+		int avStep = 0;  // 1=read slot, 2=GetConsoleHandle, 3=LookupRefFromHandle – do logu przy AV
+		__try {
+			// Opcja B: getter (RVA) + slot kontekstu (RVA) – bez REL::ID.
+			if (g_getSelectedRefRVA != 0) {
+				uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA("Starfield.exe"));
+				if (base) {
+					static bool s_loggedOptionB = false;
+					if (!s_loggedOptionB) {
+						spdlog::info("MCF: GetConsoleRefr using Option B (getter RVA 0x{:X}, context slot RVA 0x{:X})",
+							g_getSelectedRefRVA, g_consoleContextSlotRVA);
+						s_loggedOptionB = true;
+					}
+					__try {
+						void* ctx = nullptr;
+						if (g_consoleContextSlotRVA != 0) {
+							ctx = *reinterpret_cast<void**>(base + g_consoleContextSlotRVA);
+						}
+						if (g_getSelectedRefReturnsPtr) {
+							auto fn = reinterpret_cast<RE::TESObjectREFR*(*)(void*)>(base + g_getSelectedRefRVA);
+							if (fn) {
+								RE::TESObjectREFR* raw = fn(ctx);
+								if (raw) out.reset(raw);
+							}
+						} else {
+							auto fn = reinterpret_cast<void(*)(void*, RE::NiPointer<RE::TESObjectREFR>&)>(base + g_getSelectedRefRVA);
+							if (fn) fn(ctx, out);
+						}
+					}
+					__except (EXCEPTION_EXECUTE_HANDLER) {
+						static bool s_loggedAv = false;
+						if (!s_loggedAv) {
+							spdlog::warn("MCF: GetConsoleRefr Option B AV (getter 0x{:X} / context 0x{:X} – sprawdź RVA w IDA dla tej wersji .exe)",
+								g_getSelectedRefRVA, g_consoleContextSlotRVA);
+							s_loggedAv = true;
+						}
+						out.reset();
+					}
+				}
+				return;
+			}
+			uintptr_t addrOfSlot = 0;
+			if (g_consoleRefManagerSlotRVA != 0) {
+				uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA("Starfield.exe"));
+				if (base) {
+					addrOfSlot = base + g_consoleRefManagerSlotRVA;
+					static bool s_loggedSlot = false;
+					if (!s_loggedSlot) {
+						spdlog::info("MCF: GetConsoleRefr using manager slot RVA 0x{:X} (qword_145C8E6D8 from IDA)", g_consoleRefManagerSlotRVA);
+						s_loggedSlot = true;
+					}
+				}
+			}
+			if (!addrOfSlot) {
+				// 879512 = oryginalny „slot” managera; 840929 to ID RTTI (typ), nie adres – cofamy 840929.
+				REL::Relocation<std::uintptr_t> consoleReferencesManager(REL::ID(879512));
+				addrOfSlot = consoleReferencesManager.address();
+			}
+			if (!addrOfSlot) return;
+
+			void* managerPtr = nullptr;
+			uint32_t outId = 0;
+
+			__try {
+				avStep = 1;
+				managerPtr = reinterpret_cast<void*>(*reinterpret_cast<std::uintptr_t*>(addrOfSlot));
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				spdlog::warn("MCF: GetConsoleRefr AV at step 1 (reading manager from slot 0x{:X})", g_consoleRefManagerSlotRVA);
+				out.reset();
+				return;
+			}
+			if (!managerPtr) return;
+
+			__try {
+				avStep = 2;
+				if (g_getConsoleHandleRVA != 0) {
+					uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA("Starfield.exe"));
+					auto fn = reinterpret_cast<void(*)(void*, uint32_t*)>(base + g_getConsoleHandleRVA);
+					if (fn) fn(managerPtr, &outId);
+				} else {
+					REL::Relocation<void(void*, uint32_t*)> GetConsoleHandle(REL::ID(166314));
+					GetConsoleHandle(managerPtr, &outId);
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				spdlog::warn("MCF: GetConsoleRefr AV at step 2 (GetConsoleHandle – REL::ID 166314; manager slot OK, funkcja AL może być inna w tej wersji)");
+				out.reset();
+				return;
+			}
+			if (outId == 0 || outId == 0xFFFFFFFF) return;
+
+			__try {
+				avStep = 3;
+				GetRefrFromHandleImpl(outId, out);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				spdlog::warn("MCF: GetConsoleRefr AV at step 3 (LookupRefFromHandle – REL::ID 72399)");
+				out.reset();
+				return;
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			spdlog::warn("MCF: GetConsoleRefr access violation (step {} or earlier)", avStep);
+			out.reset();
+		}
+	}
+
 	static RE::NiPointer<RE::TESObjectREFR> GetConsoleRefr()
 	{
-		REL::Relocation<std::uintptr_t> consoleReferencesManager(REL::ID(879512));
-		uintptr_t addrOfSlot = consoleReferencesManager.address();
-		void* managerPtr = reinterpret_cast<void*>(*reinterpret_cast<std::uintptr_t*>(addrOfSlot));
-
-		REL::Relocation<void(void*, uint32_t*)> GetConsoleHandle(REL::ID(166314));
-		uint32_t outId = 0;
-		GetConsoleHandle(managerPtr, &outId);
-		return GetRefrFromHandle(outId);
+		RE::NiPointer<RE::TESObjectREFR> result;
+		GetConsoleRefrImpl(result);
+		return result;
 	}
 
 	class ConsoleImpl : public MCF::ConsoleInterface
@@ -101,6 +245,7 @@ namespace Commands
 		RE::TESForm* HexStrToForm(const MCF::simple_string_view& a_str) override
 		{
 			if (!a_str.data || a_str.size == 0) return nullptr;
+			if (a_str.size > kMaxHexFormLength) return nullptr;
 			try {
 				std::string str(a_str.data, a_str.size);
 				RE::TESFormID id = static_cast<RE::TESFormID>(std::stoul(str, nullptr, 16));
@@ -117,8 +262,13 @@ namespace Commands
 				PrintDefault();
 			}
 			if (log) {
-				std::string line(a_txt.data, a_txt.size);
-				log->PrintLine("%s", line.c_str());
+				size_t len = (a_txt.size <= kMaxPrintLineLength) ? a_txt.size : kMaxPrintLineLength;
+				try {
+					std::string line(a_txt.data, len);
+					log->PrintLine("%s", line.c_str());
+				} catch (...) {
+					// Nie wywalać gry przy błędnej konsoli / INI
+				}
 			}
 		}
 
@@ -152,41 +302,107 @@ namespace Commands
 
 	static ConsoleImpl g_console;
 
-	// Detour hook: REL::ID(65829) (parser step, returns 0xFFFF when done)
+	// Hook parsera (REL::ID(65829)) – stabilny wariant bez użycia starych ID z CCF.
 	using ExecuteCommandFunc = std::uint32_t(__fastcall*)(void* a_param1, void* a_param2);
 	static ExecuteCommandFunc g_originalFunc = nullptr;
 
-	static std::uint32_t __fastcall HookedExecuteCommand(void* a_param1, void* a_param2)
+	// Pierwszy token (słowo) z bufora – bez pełnego split, żeby od razu wiedzieć: MCF czy vanilla.
+	static std::string GetFirstTokenLower(const char* s, size_t maxLen)
+	{
+		size_t i = 0;
+		while (i < maxLen && s[i] != '\0' && (s[i] == ' ' || s[i] == '\t')) ++i;
+		size_t start = i;
+		while (i < maxLen && s[i] != '\0' && s[i] != ' ' && s[i] != '\t') ++i;
+		if (start >= i) return std::string();
+		return Util::str_tolower(std::string_view(s + start, i - start));
+	}
+
+	// Właściwa implementacja hooka – wywoływana z małego wrappera SEH bez obiektów z destruktorem.
+	static std::uint32_t __fastcall HookedExecuteCommand_Impl(void* a_param1, void* a_param2)
 	{
 		if (g_inHook) {
 			return g_originalFunc ? g_originalFunc(a_param1, a_param2) : 0xFFFF;
 		}
 		g_inHook = true;
 
-		const char* cmdString = nullptr;
-		if (a_param2) {
-			try {
+		static std::atomic<uint32_t> s_hookCalls{ 0 };
+		const uint32_t callNum = ++s_hookCalls;
+
+		auto passToVanilla = [&]() {
+			if (callNum <= 10) {
+				spdlog::info("MCF: HookedExecuteCommand passToVanilla (call #{})", callNum);
+			}
+			g_inHook = false;
+			return g_originalFunc ? g_originalFunc(a_param1, a_param2) : 0xFFFF;
+		};
+
+		try {
+			const char* cmdString = nullptr;
+			if (a_param2) {
 				cmdString = *reinterpret_cast<const char**>(a_param2);
-			} catch (...) {}
-		}
+			}
 
-		if (!cmdString || cmdString[0] == '\0') {
-			g_inHook = false;
-			return g_originalFunc ? g_originalFunc(a_param1, a_param2) : 0xFFFF;
-		}
+			if (!cmdString || cmdString[0] == '\0') {
+				return passToVanilla();
+			}
 
-		std::string fullCmd(cmdString);
-		auto args = Util::str_split(fullCmd, " ", '"');
-		if (args.empty()) {
-			g_inHook = false;
-			return g_originalFunc ? g_originalFunc(a_param1, a_param2) : 0xFFFF;
-		}
+			// Limit długości
+			size_t len = 0;
+			for (; len < kMaxCommandLength && cmdString[len] != '\0'; ++len) {}
+			if (len >= kMaxCommandLength) {
+				return passToVanilla();
+			}
 
-		std::string commandLower = Util::str_tolower(args[0]);
-		std::unique_lock<std::mutex> lock(g_regLock);
-		auto it = g_registrations.find(commandLower);
+			// Od razu: tylko jeśli pierwszy token to zarejestrowana komenda (np. "saf") – wchodzimy w MCF. Inaczej vanilla.
+			std::string firstToken = GetFirstTokenLower(cmdString, len);
+			if (callNum <= 10) {
+				spdlog::info("MCF: HookedExecuteCommand call #{} raw='{}', firstToken='{}'", callNum, cmdString, firstToken);
+			}
+			if (firstToken.empty()) {
+				return passToVanilla();
+			}
+			// Dodatkowe twarde wykluczenie dla 'help' – zawsze pełna vanilla,
+			// nawet jeśli jakiś inny mod przypadkowo zarejestrował taką komendę w MCF.
+			if (firstToken == "help") {
+				return passToVanilla();
+			}
+			bool hasCommand = false;
+			{
+				std::unique_lock<std::mutex> lock(g_regLock);
+				hasCommand = g_registrations.find(firstToken) != g_registrations.end();
+			}
+			if (!hasCommand) {
+				// Inna komenda (additem, coc, help, showlooksmenu, ...) – od razu vanilla, bez parsowania.
+				return passToVanilla();
+			}
 
-		if (it != g_registrations.end()) {
+			// Dopiero tu: pełne parsowanie tylko dla komend MCF (np. saf)
+			std::string fullCmd(cmdString, len);
+			auto args = Util::str_split(fullCmd, " ", '"');
+			if (args.empty()) {
+				return passToVanilla();
+			}
+			if (args.size() > kMaxArgsCount) {
+				return passToVanilla();
+			}
+
+			std::string commandLower = Util::str_tolower(args[0]);
+
+			// Pobierz callback spod mutexa; mutex musi być zwolniony PRZED passToVanilla() (nigdy return w bloku lock).
+			MCF::CommandCallback callback;
+			bool foundCommand = false;
+			{
+				std::unique_lock<std::mutex> lock(g_regLock);
+				auto it = g_registrations.find(commandLower);
+				if (it != g_registrations.end()) {
+					callback = it->second;
+					foundCommand = true;
+				}
+			}
+			if (!foundCommand) {
+				return passToVanilla();
+			}
+
 			args.erase(args.begin());
 			auto argsSSV = Util::sv_vec_to_ssv_vec(args);
 
@@ -195,10 +411,9 @@ namespace Commands
 			argsArr.count = static_cast<uint64_t>(argsSSV.size());
 
 			g_console.Reset(fullCmd.c_str());
-			lock.unlock();
 
 			try {
-				it->second(argsArr, fullCmd.c_str(), &g_console);
+				callback(argsArr, fullCmd.c_str(), &g_console);
 			} catch (const std::exception& e) {
 				spdlog::error("MCF: Exception in callback: {}", e.what());
 			} catch (...) {
@@ -207,94 +422,78 @@ namespace Commands
 
 			g_console.PrintDefault();
 			g_inHook = false;
-			// Return 0xFFFF to stop further parsing; do NOT mutate buffer
 			return 0xFFFF;
+		} catch (const std::exception& e) {
+			spdlog::error("MCF: Hook exception: {}", e.what());
+			return passToVanilla();
+		} catch (...) {
+			spdlog::error("MCF: Hook unknown exception");
+			return passToVanilla();
 		}
-
-		g_inHook = false;
-		return g_originalFunc ? g_originalFunc(a_param1, a_param2) : 0xFFFF;
 	}
 
-	static void WriteAbsoluteJmp(std::uintptr_t from, std::uintptr_t to)
+	// Cienki wrapper z SEH – zabezpiecza przed AV / innymi wyjątkami strukturalnymi
+	// (funkcja nie ma lokalnych obiektów z destruktorem, więc nie łamie C2712).
+	static std::uint32_t __fastcall HookedExecuteCommand(void* a_param1, void* a_param2)
 	{
-		std::uint8_t jmp[14]{};
-		jmp[0] = 0xFF;
-		jmp[1] = 0x25;
-		*reinterpret_cast<std::uint32_t*>(jmp + 2) = 0;
-		*reinterpret_cast<std::uint64_t*>(jmp + 6) = to;
-
-		DWORD oldProtect;
-		VirtualProtect(reinterpret_cast<void*>(from), 14, PAGE_EXECUTE_READWRITE, &oldProtect);
-		memcpy(reinterpret_cast<void*>(from), jmp, 14);
-		VirtualProtect(reinterpret_cast<void*>(from), 14, oldProtect, &oldProtect);
-		FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(from), 14);
+		__try {
+			return HookedExecuteCommand_Impl(a_param1, a_param2);
+		} 		__except (EXCEPTION_EXECUTE_HANDLER) {
+			spdlog::error("MCF: SEH in HookedExecuteCommand (access violation or similar), passing to vanilla");
+			g_inHook = false;
+			return g_originalFunc ? g_originalFunc(a_param1, a_param2) : 0xFFFF;
+		}
 	}
 
-	static bool CreateDetourHook(std::uintptr_t targetAddr, void* hookFunc, ExecuteCommandFunc* outOriginal)
+	// Dla Twojej wersji gry: ładuje mapę offset→ID z Address Library i zwraca REL::ID dla podanego RVA (offset od bazy .exe).
+	// Można wywołać np. z offsetem znalezionym w IDA – wtedy zobaczysz który ID ma Address Library dla tej wersji.
+	static std::optional<std::uint64_t> GetRELIDForOffset(std::size_t a_rva)
 	{
-		if (!targetAddr || !hookFunc || !outOriginal) return false;
-
-		constexpr size_t bytesToCopy = 16;  // align to whole instructions (prologue >= 16 bytes)
-
-		// Log original bytes for validation
-		std::uint8_t origBytes[bytesToCopy]{};
-		std::memcpy(origBytes, reinterpret_cast<void*>(targetAddr), bytesToCopy);
-		spdlog::info("MCF: Target bytes  = {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
-			origBytes[0], origBytes[1], origBytes[2], origBytes[3], origBytes[4], origBytes[5], origBytes[6], origBytes[7],
-			origBytes[8], origBytes[9], origBytes[10], origBytes[11], origBytes[12], origBytes[13], origBytes[14], origBytes[15]);
-
-		std::uintptr_t trampolineAddr = 0;
-		for (int delta = -2000; delta <= 2000; delta += 64) {
-			std::uintptr_t candidate = targetAddr + (delta * 1024 * 1024);
-			candidate &= ~0xFFFF;
-			void* result = VirtualAlloc(reinterpret_cast<void*>(candidate), 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-			if (result) {
-				trampolineAddr = reinterpret_cast<std::uintptr_t>(result);
-				break;
+		try {
+			auto* o2i = REL::Offset2ID::GetSingleton();
+			if (o2i->size() == 0) {
+				o2i->load_v5();
+				if (o2i->size() == 0)
+					o2i->load_v2();
 			}
+			if (o2i->size() == 0) return std::nullopt;
+			return o2i->get_id(a_rva);
+		} catch (...) {
+			return std::nullopt;
 		}
-		if (!trampolineAddr) {
-			spdlog::error("MCF: Failed to allocate trampoline");
-			return false;
-		}
-
-		memcpy(reinterpret_cast<void*>(trampolineAddr), reinterpret_cast<void*>(targetAddr), bytesToCopy);
-		WriteAbsoluteJmp(trampolineAddr + bytesToCopy, targetAddr + bytesToCopy);
-
-		*outOriginal = reinterpret_cast<ExecuteCommandFunc>(trampolineAddr);
-		WriteAbsoluteJmp(targetAddr, reinterpret_cast<std::uintptr_t>(hookFunc));
-		// Pad any remaining bytes with NOPs to avoid stray partial instructions
-		if (bytesToCopy > 14) {
-			const size_t pad = bytesToCopy - 14;
-			std::uint8_t nops[16]{ 0x90 };
-			DWORD oldProtect;
-			VirtualProtect(reinterpret_cast<void*>(targetAddr + 14), pad, PAGE_EXECUTE_READWRITE, &oldProtect);
-			std::memcpy(reinterpret_cast<void*>(targetAddr + 14), nops, pad);
-			VirtualProtect(reinterpret_cast<void*>(targetAddr + 14), pad, oldProtect, &oldProtect);
-			FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(targetAddr + 14), pad);
-		}
-
-		spdlog::info("MCF: Hook installed successfully");
-		spdlog::info("MCF:   Target:      {:X}", targetAddr);
-		spdlog::info("MCF:   Hook:        {:X}", reinterpret_cast<std::uintptr_t>(hookFunc));
-		spdlog::info("MCF:   Trampoline:  {:X}", trampolineAddr);
-		return true;
 	}
 
 	static void InstallHooks()
 	{
 		if (g_hookInstalled) return;
 
-		spdlog::info("MCF: Installing console hook (detour ID 65829)...");
-
+		spdlog::info("MCF: Installing console hook (REL::ID(65829))...");
 		try {
 			REL::Relocation<std::uintptr_t> target(REL::ID(65829));
-			if (CreateDetourHook(target.address(), reinterpret_cast<void*>(HookedExecuteCommand), &g_originalFunc)) {
-				g_hookInstalled = true;
-				spdlog::info("MCF: Hook installed successfully!");
-			} else {
-				spdlog::error("MCF: Hook installation failed!");
+			const std::uintptr_t targetAddr = target.address();
+			spdlog::info("MCF: Target address = {:X}", targetAddr);
+
+			// SFSE/CommonLibSF trampoline – kopiujemy 5 bajtów (pierwsza instrukcja), potem write_jmp5.
+			auto& trampoline = REL::GetTrampoline();
+			if (trampoline.empty()) {
+				spdlog::warn("MCF: Trampoline empty (SFSE Init with trampoline=true?). Creating 128 bytes.");
+				trampoline.create(128, nullptr);
 			}
+			constexpr std::size_t kPrologue = 5;
+			void* trampMem = trampoline.allocate(kPrologue + sizeof(REL::ASM::JMP14));
+			if (!trampMem) {
+				spdlog::error("MCF: Trampoline allocate failed");
+				return;
+			}
+			std::uintptr_t trampAddr = reinterpret_cast<std::uintptr_t>(trampMem);
+			std::memcpy(trampMem, reinterpret_cast<const void*>(targetAddr), kPrologue);
+			REL::ASM::JMP14 jmpBack(targetAddr + kPrologue);
+			REL::WriteSafeData(trampAddr + kPrologue, jmpBack);
+			trampoline.write_jmp5(targetAddr, reinterpret_cast<std::uintptr_t>(&HookedExecuteCommand));
+			g_originalFunc = reinterpret_cast<ExecuteCommandFunc>(trampAddr);
+
+			g_hookInstalled = true;
+			spdlog::info("MCF: Hook installed successfully (SFSE/REL trampoline, 5-byte).");
 		} catch (const std::exception& e) {
 			spdlog::error("MCF: Exception during hook install: {}", e.what());
 		} catch (...) {
