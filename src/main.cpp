@@ -1,50 +1,58 @@
-#include "PCH.h"
+#include "Pch.h"
+#include "Commands.h"
+#include <fstream>
+#include <iostream>
 
-// Initialize logging
-static void InitializeLog()
+namespace
 {
-    auto path = SFSE::log::log_directory();
-    if (!path) return;
-    
-    *path /= "ModernCommandFramework.log";
-    auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path->string(), true);
-    auto log = std::make_shared<spdlog::logger>("global log", std::move(sink));
-    
-    log->set_level(spdlog::level::info);
-    log->flush_on(spdlog::level::info);
-    
-    spdlog::set_default_logger(std::move(log));
-    spdlog::set_pattern("[%H:%M:%S.%e] [%t] [%l] %v");
+	std::ofstream g_logFile;
+
+	void InitializeLogging()
+	{
+		auto path = std::filesystem::path(std::getenv("USERPROFILE")) / "Documents" / "My Games" / "Starfield" / "SFSE" / "Logs";
+		std::filesystem::create_directories(path);
+
+		path /= std::format("{}.log", Plugin::NAME);
+		g_logFile.open(path.string(), std::ios::app);
+	}
+
+	void MessageCallback(SFSE::MessagingInterface::Message* a_msg) noexcept
+	{
+		// Stub implementation - no message handling
+	}
 }
 
-// Plugin load
-extern "C" __declspec(dllexport) bool SFSEPlugin_Load(const SFSE::LoadInterface* a_sfse)
+void LogMessage(const std::string& message)
 {
-    InitializeLog();
-    
-    spdlog::info("=====================================");
-    spdlog::info("Modern Command Framework v1.0");
-    spdlog::info("=====================================");
-    
-    SFSE::Init(a_sfse, { .trampoline = true, .trampolineSize = 256 });
-    
-    spdlog::info("MCF: Plugin loaded successfully");
-    spdlog::info("MCF: Waiting for command registrations...");
-    spdlog::info("=====================================");
-    
-    return true;
+	if (g_logFile.is_open()) {
+		auto now = std::chrono::system_clock::now();
+		auto time_t = std::chrono::system_clock::to_time_t(now);
+		auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+		
+		std::tm tm;
+		localtime_s(&tm, &time_t);
+		
+		g_logFile << std::format("[{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}.{:03d}] [INFO] {}\n",
+			tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+			tm.tm_hour, tm.tm_min, tm.tm_sec, ms.count(),
+			message);
+		g_logFile.flush();
+	}
 }
 
-// Version info
-extern "C" __declspec(dllexport) constinit auto SFSEPlugin_Version = []() {
-    SFSE::PluginVersionData v{};
-    v.PluginVersion({ 1, 0, 0, 0 });
-    v.PluginName("ModernCommandFramework");
-    v.AuthorName("mielu91m");
-    v.UsesSigScanning(false);
-    v.UsesAddressLibrary(true);
-    v.HasNoStructUse(true);
-    v.IsLayoutDependent(false);
-    v.CompatibleVersions({ SFSE::RUNTIME_LATEST });
-    return v;
-}();
+DLLEXPORT bool SFSEAPI SFSEPlugin_Load(const SFSE::LoadInterface* a_sfse)
+{
+	SFSE::Init(a_sfse, false);
+	InitializeLogging();
+
+	LogMessage(std::format("{} v{} loaded", Plugin::NAME, Plugin::Version));
+	LogMessage("Built with libxe's updated CommonLibSF");
+	LogMessage("About to call InstallHooks()...");
+
+	Commands::InstallHooks();
+	
+	LogMessage("InstallHooks() returned");
+	SFSE::GetMessagingInterface()->RegisterListener(MessageCallback);
+
+	return true;
+}

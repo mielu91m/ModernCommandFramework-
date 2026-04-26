@@ -1,121 +1,110 @@
 #pragma once
-#include <stdint.h>
-#include <string_view>
-#include <Windows.h>
 
 namespace MCF
 {
-    // Czysta struktura bez STL - bezpieczna między DLL
-    template <typename T>
-    struct simple_array
-    {
-        T* data;
-        uint64_t count;
+	//This file can be copy-pasted into other plugins to utilize the Custom Command Framework API.
 
-        simple_array() : data(nullptr), count(0) {}
-        uint64_t size() const { return count; }
-        T& operator[](uint64_t idx) { return data[idx]; }
-        const T& operator[](uint64_t idx) const { return data[idx]; }
-    };
+	template <typename T>
+	class simple_array
+	{
+	public:
+		simple_array() {}
 
-    struct simple_string_view
-    {
-        const char* data;
-        uint64_t size;
+		simple_array(std::vector<T>& a_dataSource) {
+			data = a_dataSource.data();
+			count = a_dataSource.size();
+		}
 
-        simple_string_view() : data(nullptr), size(0) {}
-        simple_string_view(const char* a_str) : data(a_str), size(a_str ? std::string_view(a_str).size() : 0) {}
-        simple_string_view(const char* d, uint64_t s) : data(d), size(s) {}
-        simple_string_view(const std::string_view& sv) : data(sv.data()), size(sv.size()) {}
-    };
+		uint64_t size() const {
+			return count;
+		}
 
-    class ConsoleInterface
-    {
-    public:
-        virtual ~ConsoleInterface() = default;
-        virtual RE::NiPointer<RE::TESObjectREFR> GetSelectedReference() = 0;
-        virtual RE::TESForm* HexStrToForm(const simple_string_view& a_str) = 0;
-        virtual void PrintLn(const simple_string_view& a_txt) = 0;
-        virtual void PreventDefaultPrint() = 0;
-    };
+		T& operator[](uint64_t a_idx) {
+			return data[a_idx];
+		}
 
-    typedef void (*CommandCallback)(const simple_array<simple_string_view>& a_args, const char* a_fullString, ConsoleInterface* a_intfc);
+		T& operator[](uint64_t a_idx) const {
+			return data[a_idx];
+		}
+	private:
+		T* data = nullptr;
+		uint64_t count = 0;
+	};
 
-    // ============================================================================
-    // Dynamiczny import funkcji z MCF.dll
-    // ============================================================================
+	class simple_string_view
+	{
+	public:
+		inline simple_string_view() {}
 
-    namespace detail
-    {
-        // Typ wskaźnika funkcji RegisterCommand eksportowanej przez MCF
-        typedef void (*RegisterCommandFunc)(const char* a_name, CommandCallback a_func);
+		inline simple_string_view(const char* a_begin, uint64_t a_size) {
+			data = a_begin;
+			size = a_size;
+		}
 
-        inline RegisterCommandFunc GetRegisterCommandFunc()
-        {
-            static RegisterCommandFunc cached = nullptr;
-            
-            if (cached) {
-                return cached;
-            }
+		inline simple_string_view(const std::string_view& a_sv) {
+			from_sv(a_sv);
+		}
 
-            // Próbuj załadować ModernCommandFramework.dll
-            HMODULE mcfHandle = GetModuleHandleA("ModernCommandFramework.dll");
-            
-            if (!mcfHandle) {
-                spdlog::warn("ModernCommandFramework.dll not loaded - attempting to load");
-                mcfHandle = LoadLibraryA("ModernCommandFramework.dll");
-            }
+		inline simple_string_view(const char* a_str) {
+			from_sv(a_str);
+		}
 
-            if (!mcfHandle) {
-                spdlog::error("Failed to load ModernCommandFramework.dll");
-                return nullptr;
-            }
+		inline simple_string_view(const std::string& a_str) {
+			data = a_str.data();
+			size = a_str.size();
+		}
 
-            // Pobierz adres funkcji RegisterCommand
-            cached = reinterpret_cast<RegisterCommandFunc>(
-                GetProcAddress(mcfHandle, "RegisterCommand")
-            );
+		inline std::string_view get() const {
+			return std::string_view(data, size);
+		}
 
-            if (!cached) {
-                spdlog::error("Failed to find RegisterCommand in ModernCommandFramework.dll");
-            }
+		inline operator std::string_view() const {
+			return get();
+		}
 
-            return cached;
-        }
-    }
+	private:
+		inline void from_sv(const std::string_view& a_sv) {
+			data = a_sv.data();
+			size = a_sv.size();
+		}
 
-    /**
-     * Rejestruje komendę konsolową przez Modern Command Framework
-     * 
-     * @param a_name Nazwa komendy (np. "saf")
-     * @param a_func Callback wywoływany gdy komenda zostanie użyta
-     * @return true jeśli MCF jest załadowane i komenda została zarejestrowana
-     */
-    inline bool RegisterCommand(const char* a_name, CommandCallback a_func)
-    {
-        auto registerFunc = detail::GetRegisterCommandFunc();
-        
-        if (!registerFunc) {
-            spdlog::warn("MCF RegisterCommand not available - is ModernCommandFramework installed?");
-            return false;
-        }
+		const char* data = nullptr;
+		uint64_t size = 0;
+	};
 
-        try {
-            registerFunc(a_name, a_func);
-            spdlog::info("Successfully registered command '{}' with MCF", a_name);
-            return true;
-        }
-        catch (...) {
-            spdlog::error("Exception when registering command '{}' with MCF", a_name);
-            return false;
-        }
-    }
+	class ConsoleInterface
+	{
+	public:
+		virtual RE::NiPointer<RE::TESObjectREFR> GetSelectedReference() = 0;
 
-    /**
-     * Sprawdza czy ModernCommandFramework jest dostępny
-     */
-    inline bool IsAvailable()
-    {
-        return detail::GetRegisterCommandFunc() != nullptr;
-    }
+		//Converts a hexadecimal string to its corresponding form (i.e. 00000014 for player, leading zeros are optional).
+		//Returns nullptr if string does not point to a valid form.
+		virtual RE::TESForm* HexStrToForm(const simple_string_view& a_str) = 0;
+
+		virtual void PrintLn(const simple_string_view& a_txt) = 0;
+
+		//This will prevent the command text from being appended to the console log.
+		//i.e. usually if you enter a command like "tfc 1" into the console, the text "tfc 1" would be printed to the console.
+		//Note: Must be called before the first call to PrintLn.
+		virtual void PreventDefaultPrint() = 0;
+	};
+
+	typedef void (*CommandCallback)(const simple_array<simple_string_view>& a_args, const char* a_fullString, ConsoleInterface* a_intfc);
+
+	namespace detail
+	{
+		typedef void (*RegCommand_Def)(const char* a_name, MCF::CommandCallback a_func);
+	}
+
+	inline bool RegisterCommand(const char* a_name, CommandCallback a_func) {
+		const auto hndl = GetModuleHandleA("ModernCommandFramework.dll");
+		if (hndl != NULL) {
+			const auto addr = GetProcAddress(hndl, "RegisterCommand");
+			if (addr != NULL) {
+				(reinterpret_cast<detail::RegCommand_Def>(addr))(a_name, a_func);
+				return true;
+			}
+		}
+		return false;
+	}
 }

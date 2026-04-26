@@ -1,17 +1,25 @@
-#include "PCH.h"
-#include "MCF_API.h"
-#include "REL/Offset2ID.h"
-#include "REL/Trampoline.h"
-#include "REL/ASM.h"
-#include "REL/Utility.h"
-#include "SFSE/API.h"
+#include "Pch.h"
+#include "Commands.h"
+#include <sstream>
+#include <thread>
 #include <algorithm>
-#include <cstring>
-#include <mutex>
-#include <optional>
-#include <string>
-#include <unordered_map>
-#include <vector>
+
+// SFSEPlugin_Version definition
+DLLEXPORT SFSE::PluginVersionData SFSEPlugin_Version{
+	SFSE::PluginVersionData::kVersion,
+	Plugin::Version,
+	"ModernCommandFramework",
+	"Mielu91",
+	1, // addressIndependence (UsesSigScanning)
+	1, // structureCompatibility (HasNoStructUse)
+	{SFSE::RUNTIME_LATEST.pack()},
+	0, // xseMinimum
+	0, // reservedNonBreaking
+	0  // reservedBreaking
+};
+
+// LogMessage is defined in main.cpp
+extern void LogMessage(const std::string& message);
 
 namespace Util
 {
@@ -25,7 +33,7 @@ namespace Util
 		return result;
 	}
 
-	static std::vector<std::string_view> str_split(const std::string_view& s, const std::string_view& delimiter, const std::optional<char>& escapeChar)
+	std::vector<std::string_view> str_split(const std::string_view& s, const std::string_view& delimiter, const std::optional<char>& escapeChar)
 	{
 		std::vector<std::string_view> substrings;
 		size_t start = 0;
@@ -33,7 +41,7 @@ namespace Util
 		bool escaped = false;
 
 		while (end < s.length()) {
-			if (escapeChar.has_value() && s[end] == escapeChar.value()) {
+			if (escapeChar.has_value() && s[end] == escapeChar) {
 				escaped = !escaped;
 			} else if (!escaped && s.substr(end, delimiter.length()) == delimiter) {
 				substrings.push_back(s.substr(start, end - start));
@@ -59,480 +67,678 @@ namespace Util
 		return substrings;
 	}
 
-	static std::string str_tolower(const std::string_view s)
+	std::string str_tolower(const std::string_view s)
 	{
 		std::string result(s);
-		std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) { return std::tolower(c); });
 		return result;
 	}
 }
 
 namespace Commands
 {
-	// Limity – zabezpieczenie przy zmodyfikowanych INI / .bat / innych modach (zawieszki, crash przy additem)
-	static constexpr size_t kMaxCommandLength = 8192;
-	static constexpr size_t kMaxArgsCount = 128;
-	static constexpr size_t kMaxPrintLineLength = 4096;
-	static constexpr size_t kMaxHexFormLength = 32;
+	static constexpr bool kEnableLegacyExecuteHook = false;
+	static constexpr bool kEnableScriptResolverProbeHook = false;
+	static constexpr bool kEnableDispatcherCallsiteHook = false;
+	static constexpr bool kEnableScriptTableInjection = true;
+	static constexpr std::uint64_t kScriptGetConsoleCommandsId = 896666;
+	static constexpr std::uint64_t kScriptGetScriptCommandsId = 896669;
+	static bool g_scriptSafInstalled = false;
+	static std::string g_scriptSafName;
+	static std::string g_scriptSafHelp;
+	static std::array<RE::SCRIPT_PARAMETER, 8> g_scriptSafParams{};
+	static std::atomic<bool> g_scriptInstallWorkerStarted = false;
+	static std::atomic<std::uint32_t> g_dispatcherHookHitCount = 0;
+	class Interface;
+	extern std::mutex regLock;
+	extern std::unordered_map<std::string, MCF::CommandCallback> registrations;
+	extern Interface intfc;
 
-	static bool g_hookInstalled = false;
-	static thread_local bool g_inHook = false;
-	static std::mutex g_regLock;
-	static std::unordered_map<std::string, MCF::CommandCallback> g_registrations;
-
-	// Opcja B: pojedynczy getter (Selected Ref) + slot kontekstu – tylko RVA z IDA, bez REL::ID.
-	// Getter: funkcja wywoływana przed "Selected Actor: %s" / "Selected Ref: %s", zwraca REFR* (RAX) lub void(ctx, NiPointer&).
-	// Kontekst: globalny qword (np. qword_1450455F0 → 0x50455F0), przekazywany w RCX do gettera.
-	static uint32_t g_getSelectedRefRVA = 0x2853E40u;   // getter z IDA (sub przy "Selected Actor")
-	static bool g_getSelectedRefReturnsPtr = true;      // true = getter zwraca REFR* w RAX
-	static uint32_t g_consoleContextSlotRVA = 0x50455F0u;  // slot kontekstu (mov rcx, cs:qword przed call gettera)
-	// Opcja 2 (gdy opcja 1 nie działa): trzy osobne adresy (slot, GetConsoleHandle, LookupRefFromHandle).
-	// 0x5C8E6D8 = RVA qword_145C8E6D8 z IDA (xrefs: 2 zapisy, ~30 odczytów; getter sub_142C54A80).
-	static uint32_t g_consoleRefManagerSlotRVA = 0x5C8E6D8u;  // slot „managera konsoli”
-	static uint32_t g_getConsoleHandleRVA = 0;       // Funkcja void(*)(void* manager, uint32_t* outHandle).
-	static uint32_t g_lookupRefFromHandleRVA = 0;   // Funkcja void(*)(NiPointer<TESObjectREFR>& out, uint32_t* handle).
-
-	static void GetRefrFromHandleImpl(uint32_t handle, RE::NiPointer<RE::TESObjectREFR>& out)
+	std::uint64_t ResolveIdWithFallback(std::uint64_t commonlibId, std::uint64_t fallbackId, const char* name)
 	{
-		__try {
-			if (g_lookupRefFromHandleRVA != 0) {
-				uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA("Starfield.exe"));
-				auto fn = reinterpret_cast<void(*)(RE::NiPointer<RE::TESObjectREFR>&, uint32_t*)>(base + g_lookupRefFromHandleRVA);
-				if (fn) fn(out, &handle);
+		if (commonlibId != 0) {
+			LogMessage(std::format("MCF: Using commonlib ID {} = {}", name, commonlibId));
+			return commonlibId;
+		}
+
+		LogMessage(std::format("MCF: Using fallback ID {} = {}", name, fallbackId));
+		return fallbackId;
+	}
+
+	using ScriptResolverFunc = bool (*)(void*);
+	ScriptResolverFunc OriginalScriptResolverCallA = nullptr;
+	ScriptResolverFunc OriginalScriptResolverCallB = nullptr;
+	using DispatcherCallsiteFunc = std::int32_t (*)(void*, void*);
+	DispatcherCallsiteFunc OriginalDispatcherCallsite = nullptr;
+
+	bool TryCopyToken(void* tokenCtx, std::string& outToken)
+	{
+		outToken.clear();
+		if (!tokenCtx) {
+			return false;
+		}
+
+		constexpr size_t kMaxTokenLen = 0x200;
+		auto* ptr = static_cast<const char*>(tokenCtx);
+		MEMORY_BASIC_INFORMATION mbi{};
+		if (VirtualQuery(ptr, &mbi, sizeof(mbi)) == 0) {
+			return false;
+		}
+
+		const bool readable = (mbi.Protect & PAGE_READONLY) || (mbi.Protect & PAGE_READWRITE) || (mbi.Protect & PAGE_EXECUTE_READ) || (mbi.Protect & PAGE_EXECUTE_READWRITE);
+		if ((mbi.State != MEM_COMMIT) || !readable) {
+			return false;
+		}
+
+		size_t len = 0;
+		while (len < kMaxTokenLen && ptr[len] != '\0') {
+			++len;
+		}
+		outToken.assign(ptr, len);
+		return true;
+	}
+
+	bool ScriptResolverProbeHookA(void* tokenCtx)
+	{
+		const auto result = OriginalScriptResolverCallA(tokenCtx);
+		std::string token;
+		if (TryCopyToken(tokenCtx, token) && Util::str_tolower(token) == "saf") {
+			LogMessage(std::format("MCF: resolver call A hit for token='{}', result={}", token, result ? 1 : 0));
+		}
+		return result;
+	}
+
+	bool ScriptResolverProbeHookB(void* tokenCtx)
+	{
+		const auto result = OriginalScriptResolverCallB(tokenCtx);
+		std::string token;
+		if (TryCopyToken(tokenCtx, token) && Util::str_tolower(token) == "saf") {
+			LogMessage(std::format("MCF: resolver call B hit for token='{}', result={}", token, result ? 1 : 0));
+		}
+		return result;
+	}
+
+	void LogIdDiagnostics()
+	{
+		LogMessage("MCF: ID diagnostics (commonlibsf)");
+
+		const auto logIdState = [](const char* name, std::uint64_t id) {
+			if (id == 0) {
+				LogMessage(std::format("MCF: ID {} = 0 (INVALID/UNMAPPED in this commonlib build)", name));
 			} else {
-				REL::Relocation<void(RE::NiPointer<RE::TESObjectREFR>&, uint32_t*)> func(REL::ID(72399));
-				func(out, &handle);
+				LogMessage(std::format("MCF: ID {} = {} (non-zero, candidate for REL::ID)", name, id));
 			}
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {
-			out.reset();
-		}
+		};
+
+		// IDs used by legacy 1.15 logic in this project
+		logIdState("Legacy.ExecuteHookBase", 166307);
+		logIdState("GetConsoleHandle", 166314);
+		logIdState("GetRefrFromHandle", 72399);
+		logIdState("ConsoleReferencesManager", 879512);
+
+		// Known script IDs from RE::IDs.h in current commonlibsf branch
+		logIdState("RE::ID::Script::GetConsoleCommands", RE::ID::Script::GetConsoleCommands.id());
+		logIdState("RE::ID::Script::GetScriptCommands", RE::ID::Script::GetScriptCommands.id());
+		logIdState("MCF::Fallback::Script::GetConsoleCommands", kScriptGetConsoleCommandsId);
+		logIdState("MCF::Fallback::Script::GetScriptCommands", kScriptGetScriptCommandsId);
+
+		[[maybe_unused]] const auto resolvedConsoleCommands = ResolveIdWithFallback(
+			RE::ID::Script::GetConsoleCommands.id(),
+			kScriptGetConsoleCommandsId,
+			"Script::GetConsoleCommands");
+		[[maybe_unused]] const auto resolvedScriptCommands = ResolveIdWithFallback(
+			RE::ID::Script::GetScriptCommands.id(),
+			kScriptGetScriptCommandsId,
+			"Script::GetScriptCommands");
 	}
 
-	static RE::NiPointer<RE::TESObjectREFR> GetRefrFromHandle(uint32_t handle)
+	RE::NiPointer<RE::TESObjectREFR> GetRefrFromHandle(uint32_t handle)
 	{
 		RE::NiPointer<RE::TESObjectREFR> result;
-		GetRefrFromHandleImpl(handle, result);
+		REL::Relocation<void(RE::NiPointer<RE::TESObjectREFR>&, uint32_t*)> func(REL::ID(72399));
+		func(result, &handle);
 		return result;
 	}
 
-	// __try w osobnym wrapperze (bez lokalnych obiektow z destruktorem).
-	static void GetConsoleRefrImpl(RE::NiPointer<RE::TESObjectREFR>& out)
+	RE::NiPointer<RE::TESObjectREFR> GetConsoleRefr()
 	{
-		out.reset();
-		int avStep = 0;  // 1=read slot, 2=GetConsoleHandle, 3=LookupRefFromHandle – do logu przy AV
-		__try {
-			// Opcja B: getter (RVA) + slot kontekstu (RVA) – bez REL::ID.
-			if (g_getSelectedRefRVA != 0) {
-				uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA("Starfield.exe"));
-				if (base) {
-					static bool s_loggedOptionB = false;
-					if (!s_loggedOptionB) {
-						spdlog::info("MCF: GetConsoleRefr using Option B (getter RVA 0x{:X}, context slot RVA 0x{:X})",
-							g_getSelectedRefRVA, g_consoleContextSlotRVA);
-						s_loggedOptionB = true;
-					}
-					__try {
-						void* ctx = nullptr;
-						if (g_consoleContextSlotRVA != 0) {
-							ctx = *reinterpret_cast<void**>(base + g_consoleContextSlotRVA);
-						}
-						if (g_getSelectedRefReturnsPtr) {
-							auto fn = reinterpret_cast<RE::TESObjectREFR*(*)(void*)>(base + g_getSelectedRefRVA);
-							if (fn) {
-								RE::TESObjectREFR* raw = fn(ctx);
-								if (raw) out.reset(raw);
-							}
-						} else {
-							auto fn = reinterpret_cast<void(*)(void*, RE::NiPointer<RE::TESObjectREFR>&)>(base + g_getSelectedRefRVA);
-							if (fn) fn(ctx, out);
-						}
-					}
-					__except (EXCEPTION_EXECUTE_HANDLER) {
-						static bool s_loggedAv = false;
-						if (!s_loggedAv) {
-							spdlog::warn("MCF: GetConsoleRefr Option B AV (getter 0x{:X} / context 0x{:X} – sprawdź RVA w IDA dla tej wersji .exe)",
-								g_getSelectedRefRVA, g_consoleContextSlotRVA);
-							s_loggedAv = true;
-						}
-						out.reset();
-					}
-				}
-				return;
-			}
-			uintptr_t addrOfSlot = 0;
-			if (g_consoleRefManagerSlotRVA != 0) {
-				uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA("Starfield.exe"));
-				if (base) {
-					addrOfSlot = base + g_consoleRefManagerSlotRVA;
-					static bool s_loggedSlot = false;
-					if (!s_loggedSlot) {
-						spdlog::info("MCF: GetConsoleRefr using manager slot RVA 0x{:X} (qword_145C8E6D8 from IDA)", g_consoleRefManagerSlotRVA);
-						s_loggedSlot = true;
-					}
-				}
-			}
-			if (!addrOfSlot) {
-				// 879512 = oryginalny „slot” managera; 840929 to ID RTTI (typ), nie adres – cofamy 840929.
-				REL::Relocation<std::uintptr_t> consoleReferencesManager(REL::ID(879512));
-				addrOfSlot = consoleReferencesManager.address();
-			}
-			if (!addrOfSlot) return;
-
-			void* managerPtr = nullptr;
-			uint32_t outId = 0;
-
-			__try {
-				avStep = 1;
-				managerPtr = reinterpret_cast<void*>(*reinterpret_cast<std::uintptr_t*>(addrOfSlot));
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {
-				spdlog::warn("MCF: GetConsoleRefr AV at step 1 (reading manager from slot 0x{:X})", g_consoleRefManagerSlotRVA);
-				out.reset();
-				return;
-			}
-			if (!managerPtr) return;
-
-			__try {
-				avStep = 2;
-				if (g_getConsoleHandleRVA != 0) {
-					uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA("Starfield.exe"));
-					auto fn = reinterpret_cast<void(*)(void*, uint32_t*)>(base + g_getConsoleHandleRVA);
-					if (fn) fn(managerPtr, &outId);
-				} else {
-					REL::Relocation<void(void*, uint32_t*)> GetConsoleHandle(REL::ID(166314));
-					GetConsoleHandle(managerPtr, &outId);
-				}
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {
-				spdlog::warn("MCF: GetConsoleRefr AV at step 2 (GetConsoleHandle – REL::ID 166314; manager slot OK, funkcja AL może być inna w tej wersji)");
-				out.reset();
-				return;
-			}
-			if (outId == 0 || outId == 0xFFFFFFFF) return;
-
-			__try {
-				avStep = 3;
-				GetRefrFromHandleImpl(outId, out);
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {
-				spdlog::warn("MCF: GetConsoleRefr AV at step 3 (LookupRefFromHandle – REL::ID 72399)");
-				out.reset();
-				return;
-			}
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {
-			spdlog::warn("MCF: GetConsoleRefr access violation (step {} or earlier)", avStep);
-			out.reset();
-		}
+		REL::Relocation<uint64_t**> consoleReferencesManager(REL::ID(879512));
+		REL::Relocation<uint32_t* (uint64_t*, uint32_t*)> GetConsoleHandle(REL::ID(166314));
+		uint32_t outId = 0;
+		GetConsoleHandle(*consoleReferencesManager, &outId);
+		return GetRefrFromHandle(outId);
 	}
 
-	static RE::NiPointer<RE::TESObjectREFR> GetConsoleRefr()
-	{
-		RE::NiPointer<RE::TESObjectREFR> result;
-		GetConsoleRefrImpl(result);
-		return result;
-	}
-
-	class ConsoleImpl : public MCF::ConsoleInterface
+	class Interface : public MCF::ConsoleInterface
 	{
 	public:
-		RE::NiPointer<RE::TESObjectREFR> GetSelectedReference() override
-		{
+		virtual RE::NiPointer<RE::TESObjectREFR> GetSelectedReference() {
 			return GetConsoleRefr();
 		}
 
-		RE::TESForm* HexStrToForm(const MCF::simple_string_view& a_str) override
-		{
-			if (!a_str.data || a_str.size == 0) return nullptr;
-			if (a_str.size > kMaxHexFormLength) return nullptr;
+		virtual RE::TESForm* HexStrToForm(const MCF::simple_string_view& a_str) {
+			uint32_t formId;
 			try {
-				std::string str(a_str.data, a_str.size);
-				RE::TESFormID id = static_cast<RE::TESFormID>(std::stoul(str, nullptr, 16));
-				return RE::TESForm::LookupByID(id);
-			} catch (...) {
+				formId = std::stoul(std::string{ a_str.get() }, nullptr, 16);
+			} catch (std::exception) {
 				return nullptr;
 			}
+
+			return RE::TESForm::LookupByID(formId);
 		}
 
-		void PrintLn(const MCF::simple_string_view& a_txt) override
-		{
-			if (!a_txt.data) return;
-			if (!printedDefault) {
-				PrintDefault();
-			}
-			if (log) {
-				size_t len = (a_txt.size <= kMaxPrintLineLength) ? a_txt.size : kMaxPrintLineLength;
-				try {
-					std::string line(a_txt.data, len);
-					log->PrintLine("%s", line.c_str());
-				} catch (...) {
-					// Nie wywalać gry przy błędnej konsoli / INI
+		virtual void PrintLn(const MCF::simple_string_view& a_txt) {
+			if (log != nullptr) {
+				if (!printedDefault) {
+					log->PrintLine(defText);
+					printedDefault = true;
 				}
+				log->PrintLine(std::string{ a_txt.get() }.c_str());
 			}
 		}
 
-		void PreventDefaultPrint() override
-		{
+		virtual void PreventDefaultPrint() {
 			printedDefault = true;
 		}
 
-		void PrintDefault()
-		{
-			if (!printedDefault && log) {
-				log->PrintLine("%s", defText);
+		void PrintDefault() {
+			if (!printedDefault && log != nullptr) {
+				log->PrintLine(defText);
 				printedDefault = true;
 			}
 		}
 
-		void Reset(const char* a_txt)
-		{
-			if (!log) {
+		void Reset(const char* a_txt) {
+			if (log == nullptr) {
 				log = RE::ConsoleLog::GetSingleton();
 			}
 			defText = a_txt;
 			printedDefault = false;
 		}
 
-	private:
-		RE::ConsoleLog* log{ nullptr };
-		const char* defText{ nullptr };
-		bool printedDefault{ false };
+		RE::ConsoleLog* log = nullptr;
+		const char* defText = nullptr;
+		bool printedDefault = false;
 	};
 
-	static ConsoleImpl g_console;
+	typedef void (*ExecuteCommandFunc)(void*, char*);
 
-	// Hook parsera (REL::ID(65829)) – stabilny wariant bez użycia starych ID z CCF.
-	using ExecuteCommandFunc = std::uint32_t(__fastcall*)(void* a_param1, void* a_param2);
-	static ExecuteCommandFunc g_originalFunc = nullptr;
+	ExecuteCommandFunc OriginalExecuteCommand;
+	std::mutex regLock;
+	std::unordered_map<std::string, MCF::CommandCallback> registrations;
+	Interface intfc;
 
-	// Pierwszy token (słowo) z bufora – bez pełnego split, żeby od razu wiedzieć: MCF czy vanilla.
-	static std::string GetFirstTokenLower(const char* s, size_t maxLen)
+	bool TryCopyCommandFromDispatcherCtx(void* dispatcherCtx, std::string& outCmd)
 	{
-		size_t i = 0;
-		while (i < maxLen && s[i] != '\0' && (s[i] == ' ' || s[i] == '\t')) ++i;
-		size_t start = i;
-		while (i < maxLen && s[i] != '\0' && s[i] != ' ' && s[i] != '\t') ++i;
-		if (start >= i) return std::string();
-		return Util::str_tolower(std::string_view(s + start, i - start));
+		outCmd.clear();
+		if (!dispatcherCtx) {
+			return false;
+		}
+
+		auto* text = reinterpret_cast<const char*>(dispatcherCtx) + 0x4;
+		MEMORY_BASIC_INFORMATION mbi{};
+		if (VirtualQuery(text, &mbi, sizeof(mbi)) == 0) {
+			return false;
+		}
+
+		const bool readable = (mbi.Protect & PAGE_READONLY) || (mbi.Protect & PAGE_READWRITE) ||
+			(mbi.Protect & PAGE_EXECUTE_READ) || (mbi.Protect & PAGE_EXECUTE_READWRITE);
+		if ((mbi.State != MEM_COMMIT) || !readable) {
+			return false;
+		}
+
+		constexpr size_t kMaxLen = 0x200;
+		size_t len = 0;
+		while (len < kMaxLen && text[len] != '\0') {
+			++len;
+		}
+		if (len == 0 || len >= kMaxLen) {
+			return false;
+		}
+
+		outCmd.assign(text, len);
+		return true;
 	}
 
-	// Właściwa implementacja hooka – wywoływana z małego wrappera SEH bez obiektów z destruktorem.
-	static std::uint32_t __fastcall HookedExecuteCommand_Impl(void* a_param1, void* a_param2)
+	std::int32_t DispatcherCallsiteHook(void* a_ctx, void* a_dispatcherCtx)
 	{
-		if (g_inHook) {
-			return g_originalFunc ? g_originalFunc(a_param1, a_param2) : 0xFFFF;
+		std::string cmdLine;
+		const bool gotCmd = TryCopyCommandFromDispatcherCtx(a_dispatcherCtx, cmdLine);
+		const auto hit = ++g_dispatcherHookHitCount;
+		if (hit <= 20) {
+			LogMessage(std::format("MCF: Dispatcher hook hit #{} cmd='{}' gotCmd={}", hit, gotCmd ? cmdLine : "<unreadable>", gotCmd ? 1 : 0));
 		}
-		g_inHook = true;
 
-		static std::atomic<uint32_t> s_hookCalls{ 0 };
-		const uint32_t callNum = ++s_hookCalls;
+		if (!gotCmd || cmdLine.empty()) {
+			return OriginalDispatcherCallsite(a_ctx, a_dispatcherCtx);
+		}
 
-		auto passToVanilla = [&]() {
-			if (callNum <= 10) {
-				spdlog::info("MCF: HookedExecuteCommand passToVanilla (call #{})", callNum);
-			}
-			g_inHook = false;
-			return g_originalFunc ? g_originalFunc(a_param1, a_param2) : 0xFFFF;
-		};
+		auto args = Util::str_split(cmdLine, " ", '\"');
+		if (args.empty()) {
+			return OriginalDispatcherCallsite(a_ctx, a_dispatcherCtx);
+		}
 
-		try {
-			const char* cmdString = nullptr;
-			if (a_param2) {
-				cmdString = *reinterpret_cast<const char**>(a_param2);
-			}
+		if (Util::str_tolower(args[0]) != "saf") {
+			return OriginalDispatcherCallsite(a_ctx, a_dispatcherCtx);
+		}
 
-			if (!cmdString || cmdString[0] == '\0') {
-				return passToVanilla();
-			}
+		std::unique_lock l{ regLock };
+		if (auto iter = registrations.find("saf"); iter != registrations.end()) {
+			args.erase(args.begin());
+			auto argsSSV = Util::sv_vec_to_ssv_vec(args);
+			MCF::simple_array<MCF::simple_string_view> argsArr(argsSSV);
+			intfc.Reset(cmdLine.c_str());
+			LogMessage(std::format("MCF: Dispatcher callsite handled '{}'", cmdLine));
+			iter->second(argsArr, cmdLine.c_str(), &intfc);
+			intfc.PrintDefault();
+			return 0xFFFF;
+		}
 
-			// Limit długości
-			size_t len = 0;
-			for (; len < kMaxCommandLength && cmdString[len] != '\0'; ++len) {}
-			if (len >= kMaxCommandLength) {
-				return passToVanilla();
-			}
+		LogMessage("MCF: Dispatcher callsite saw saf, but no registration found");
+		return OriginalDispatcherCallsite(a_ctx, a_dispatcherCtx);
+	}
 
-			// Od razu: tylko jeśli pierwszy token to zarejestrowana komenda (np. "saf") – wchodzimy w MCF. Inaczej vanilla.
-			std::string firstToken = GetFirstTokenLower(cmdString, len);
-			if (callNum <= 10) {
-				spdlog::info("MCF: HookedExecuteCommand call #{} raw='{}', firstToken='{}'", callNum, cmdString, firstToken);
-			}
-			if (firstToken.empty()) {
-				return passToVanilla();
-			}
-			// Dodatkowe twarde wykluczenie dla 'help' – zawsze pełna vanilla,
-			// nawet jeśli jakiś inny mod przypadkowo zarejestrował taką komendę w MCF.
-			if (firstToken == "help") {
-				return passToVanilla();
-			}
-			bool hasCommand = false;
-			{
-				std::unique_lock<std::mutex> lock(g_regLock);
-				hasCommand = g_registrations.find(firstToken) != g_registrations.end();
-			}
-			if (!hasCommand) {
-				// Inna komenda (additem, coc, help, showlooksmenu, ...) – od razu vanilla, bez parsowania.
-				return passToVanilla();
-			}
+	std::span<RE::SCRIPT_FUNCTION, RE::Script::kNumScriptCommands> GetScriptCommandsTable()
+	{
+		const auto resolvedId = ResolveIdWithFallback(
+			RE::ID::Script::GetScriptCommands.id(),
+			kScriptGetScriptCommandsId,
+			"Script::GetScriptCommands");
+		static REL::Relocation<RE::SCRIPT_FUNCTION(*)[RE::Script::kNumScriptCommands]> table{ REL::ID(resolvedId) };
+		return std::span{ *table };
+	}
 
-			// Dopiero tu: pełne parsowanie tylko dla komend MCF (np. saf)
-			std::string fullCmd(cmdString, len);
-			auto args = Util::str_split(fullCmd, " ", '"');
-			if (args.empty()) {
-				return passToVanilla();
+	bool MCFScriptSafExecute(const RE::SCRIPT_PARAMETER*, const char* a_scriptText, RE::TESObjectREFR*, RE::TESObjectREFR*, RE::Script*, RE::ScriptLocals*, float* a_result, std::uint32_t*)
+	{
+		auto isMostlyPrintable = [](const std::string& s) {
+			if (s.empty()) {
+				return false;
 			}
-			if (args.size() > kMaxArgsCount) {
-				return passToVanilla();
-			}
-
-			std::string commandLower = Util::str_tolower(args[0]);
-
-			// Pobierz callback spod mutexa; mutex musi być zwolniony PRZED passToVanilla() (nigdy return w bloku lock).
-			MCF::CommandCallback callback;
-			bool foundCommand = false;
-			{
-				std::unique_lock<std::mutex> lock(g_regLock);
-				auto it = g_registrations.find(commandLower);
-				if (it != g_registrations.end()) {
-					callback = it->second;
-					foundCommand = true;
+			std::size_t printable = 0;
+			for (unsigned char c : s) {
+				if ((c >= 32 && c <= 126) || c == '\t') {
+					++printable;
 				}
 			}
-			if (!foundCommand) {
-				return passToVanilla();
+			return printable * 100 >= s.size() * 85;
+		};
+
+		auto readLastConsoleHistorySaf = []() -> std::string {
+			const auto path = std::filesystem::path(std::getenv("USERPROFILE")) / "Documents" / "My Games" / "Starfield" / "StarfieldConsoleHistory.log";
+			std::ifstream in(path);
+			if (!in.is_open()) {
+				return {};
 			}
+
+			std::string line;
+			std::string lastSaf;
+			while (std::getline(in, line)) {
+				if (line.empty()) {
+					continue;
+				}
+				auto lower = Util::str_tolower(line);
+				if (lower.rfind("saf ", 0) == 0 || lower == "saf") {
+					lastSaf = line;
+				}
+			}
+			return lastSaf;
+		};
+
+		std::string cmdLine = a_scriptText ? a_scriptText : "";
+		if (!isMostlyPrintable(cmdLine)) {
+			auto historyCmd = readLastConsoleHistorySaf();
+			if (!historyCmd.empty()) {
+				LogMessage(std::format("MCF: ScriptCommands raw looked binary, using console history '{}'", historyCmd));
+				cmdLine = historyCmd;
+			}
+		}
+		if (cmdLine.empty()) {
+			cmdLine = "saf";
+		}
+
+		LogMessage(std::format("MCF: ScriptCommands execute entry hit, raw='{}'", cmdLine));
+		auto args = Util::str_split(cmdLine, " ", '\"');
+		if (args.empty()) {
+			args.push_back("saf");
+		}
+
+		// Normalize input so SAF callback always receives args without "saf".
+		const auto lower0 = Util::str_tolower(args[0]);
+		if (lower0 == "saf") {
+			args.erase(args.begin());
+		} else {
+			auto it = std::find_if(args.begin(), args.end(), [](const std::string_view v) {
+				return Util::str_tolower(v) == "saf";
+			});
+			if (it != args.end()) {
+				args.erase(args.begin(), std::next(it));
+			}
+		}
+		if (args.empty()) {
+			// Keep explicit empty-args semantics for plain "saf".
+			cmdLine = "saf";
+		} else {
+			std::string rebuilt = "saf";
+			for (auto a : args) {
+				rebuilt += " ";
+				rebuilt += std::string(a);
+			}
+			cmdLine = rebuilt;
+		}
+
+		std::unique_lock l{ regLock };
+		if (auto iter = registrations.find("saf"); iter != registrations.end()) {
+			auto argsSSV = Util::sv_vec_to_ssv_vec(args);
+			MCF::simple_array<MCF::simple_string_view> argsArr(argsSSV);
+			intfc.Reset(cmdLine.c_str());
+			LogMessage(std::format("MCF: ScriptCommands dispatching '{}' with {} args", cmdLine, argsArr.size()));
+			iter->second(argsArr, cmdLine.c_str(), &intfc);
+			intfc.PrintDefault();
+			if (a_result) {
+				*a_result = 1.0f;
+			}
+			LogMessage(std::format("MCF: ScriptCommands execute handled '{}'", cmdLine));
+			return true;
+		}
+
+		LogMessage("MCF: ScriptCommands execute called for saf, but no registration found");
+		return false;
+	}
+
+	bool TryInstallSafScriptCommand(bool logFailures)
+	{
+		if (g_scriptSafInstalled) {
+			return true;
+		}
+
+		auto commands = GetScriptCommandsTable();
+		RE::SCRIPT_FUNCTION* templateEntry = nullptr;
+		RE::SCRIPT_FUNCTION* targetEntry = nullptr;
+		RE::SCRIPT_FUNCTION* nullExecEntry = nullptr;
+		RE::SCRIPT_FUNCTION* unusedNamedEntry = nullptr;
+		std::size_t emptyNameCount = 0;
+		std::size_t nullExecCount = 0;
+		int bestTemplateScore = std::numeric_limits<int>::min();
+		std::string chosenTemplateParams;
+		const auto scoreTemplate = [](const RE::SCRIPT_FUNCTION& command) {
+			if (!command.functionName || !command.executeFunction) {
+				return std::numeric_limits<int>::min();
+			}
+
+			int score = 0;
+			const auto nameLower = Util::str_tolower(command.functionName);
+			if (nameLower == "help" || nameLower == "cqf") {
+				score += 120;
+			}
+			if (nameLower == "setstage" || nameLower == "startquest" || nameLower == "sqs") {
+				score -= 200;
+			}
+
+			if (command.referenceFunction == 0) {
+				score += 15;
+			}
+			if (command.numParams >= 2 && command.numParams <= 4) {
+				score += 20;
+			} else if (command.numParams == 1) {
+				score += 5;
+			}
+
+			for (std::uint16_t i = 0; i < command.numParams && command.params; ++i) {
+				const char* p = command.params[i].paramName ? command.params[i].paramName : "";
+				auto pLower = Util::str_tolower(p);
+				if (pLower.find("quest") != std::string::npos || pLower.find("ref") != std::string::npos ||
+					pLower.find("actor") != std::string::npos || pLower.find("cell") != std::string::npos ||
+					pLower.find("object") != std::string::npos || pLower.find("alias") != std::string::npos) {
+					score -= 80;
+				}
+				if (pLower.find("string") != std::string::npos || pLower.find("text") != std::string::npos ||
+					pLower.find("name") != std::string::npos || pLower.find("command") != std::string::npos ||
+					pLower.find("file") != std::string::npos) {
+					score += 40;
+				}
+			}
+
+			return score;
+		};
+
+		for (auto& command : commands) {
+			if (command.functionName && command.executeFunction) {
+				const int score = scoreTemplate(command);
+				if (score > bestTemplateScore) {
+					bestTemplateScore = score;
+					templateEntry = std::addressof(command);
+					chosenTemplateParams.clear();
+					for (std::uint16_t i = 0; i < command.numParams && command.params; ++i) {
+						if (!chosenTemplateParams.empty()) {
+							chosenTemplateParams += ", ";
+						}
+						chosenTemplateParams += (command.params[i].paramName ? command.params[i].paramName : "<null>");
+					}
+				}
+			}
+			if (command.functionName && _stricmp(command.functionName, "saf") == 0) {
+				targetEntry = std::addressof(command);
+				break;
+			}
+			if ((!command.functionName || command.functionName[0] == '\0')) {
+				++emptyNameCount;
+			}
+			if (!command.executeFunction) {
+				++nullExecCount;
+				if (!nullExecEntry) {
+					nullExecEntry = std::addressof(command);
+				}
+			}
+			if (command.functionName) {
+				auto nameLower = Util::str_tolower(command.functionName);
+				if (!unusedNamedEntry && (nameLower.find("unused") != std::string::npos || nameLower.find("reserved") != std::string::npos)) {
+					unusedNamedEntry = std::addressof(command);
+				}
+			}
+		}
+
+		bool hijackingLiveSlot = false;
+		if (targetEntry && targetEntry->executeFunction != &MCFScriptSafExecute) {
+			// Ignore pre-existing saf entry if it is not ours; force a live slot hijack path.
+			targetEntry = nullptr;
+		}
+		if (!targetEntry && templateEntry) {
+			// Force live-slot hijack for 1.16: empty slots appear non-executable in runtime dispatch.
+			targetEntry = templateEntry;
+			hijackingLiveSlot = true;
+			LogMessage(std::format("MCF: Forcing live ScriptCommands slot hijack '{}'", templateEntry->functionName ? templateEntry->functionName : "<null>"));
+		}
+		if (!targetEntry && nullExecEntry) {
+			targetEntry = nullExecEntry;
+			LogMessage("MCF: Reusing ScriptCommands slot with null executeFunction");
+		}
+		if (!targetEntry && unusedNamedEntry) {
+			targetEntry = unusedNamedEntry;
+			LogMessage(std::format("MCF: Reusing ScriptCommands slot named '{}'", targetEntry->functionName ? targetEntry->functionName : "<null>"));
+		}
+
+		if (!templateEntry || !targetEntry) {
+			if (emptyNameCount == RE::Script::kNumScriptCommands && nullExecCount == RE::Script::kNumScriptCommands) {
+				if (logFailures) {
+					LogMessage("MCF: ScriptCommands table not initialized yet (all entries empty)");
+				}
+			} else if (logFailures) {
+				LogMessage(std::format(
+					"MCF: Failed to install saf into ScriptCommands table (no template/slot). emptyNameCount={}, nullExecCount={}",
+					emptyNameCount,
+					nullExecCount));
+			}
+			return false;
+		}
+
+		g_scriptSafName = "saf";
+		g_scriptSafHelp = "MCF custom command dispatcher";
+
+		DWORD oldProtect = 0;
+		if (!VirtualProtect(targetEntry, sizeof(RE::SCRIPT_FUNCTION), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+			LogMessage("MCF: VirtualProtect failed for ScriptCommands entry");
+			return false;
+		}
+
+		*targetEntry = *templateEntry;
+		targetEntry->functionName = g_scriptSafName.c_str();
+		targetEntry->shortName = g_scriptSafName.c_str();
+		targetEntry->helpString = g_scriptSafHelp.c_str();
+		// Allow SAF commands with multiple optional arguments, e.g. "saf play pen 5998".
+		// Reuse template paramType (typically String) to satisfy parser expectations.
+		const std::uint32_t safParamType = (templateEntry->numParams > 0 && templateEntry->params) ? templateEntry->params[0].paramType : 0;
+		for (std::size_t i = 0; i < g_scriptSafParams.size(); ++i) {
+			g_scriptSafParams[i].paramName = "Arg (Optional)";
+			g_scriptSafParams[i].paramType = safParamType;
+			g_scriptSafParams[i].optional = true;
+		}
+		targetEntry->numParams = static_cast<std::uint16_t>(g_scriptSafParams.size());
+		targetEntry->params = g_scriptSafParams.data();
+		targetEntry->executeFunction = &MCFScriptSafExecute;
+
+		DWORD tmpProtect = 0;
+		(void)VirtualProtect(targetEntry, sizeof(RE::SCRIPT_FUNCTION), oldProtect, &tmpProtect);
+
+		g_scriptSafInstalled = true;
+		LogMessage(std::format(
+			"MCF: Installed saf entry into ScriptCommands table (template='{}', output={}, refFn={}, numParams={}, score={}, hijackLiveSlot={}, params=[{}])",
+			templateEntry->functionName ? templateEntry->functionName : "<null>",
+			templateEntry->output,
+			templateEntry->referenceFunction,
+			templateEntry->numParams,
+			bestTemplateScore,
+			hijackingLiveSlot ? 1 : 0,
+			chosenTemplateParams));
+		return true;
+	}
+
+	void InstallSafScriptCommand()
+	{
+		if (TryInstallSafScriptCommand(true)) {
+			return;
+		}
+
+		if (g_scriptInstallWorkerStarted.exchange(true)) {
+			return;
+		}
+
+		std::thread([]() {
+			LogMessage("MCF: Starting delayed ScriptCommands install retry worker");
+			for (int attempt = 1; attempt <= 120 && !g_scriptSafInstalled; ++attempt) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(250));
+				if (TryInstallSafScriptCommand(false)) {
+					LogMessage(std::format("MCF: Delayed ScriptCommands install succeeded on attempt {}", attempt));
+					g_scriptInstallWorkerStarted = false;
+					return;
+				}
+			}
+			LogMessage("MCF: Delayed ScriptCommands install failed after retries");
+			g_scriptInstallWorkerStarted = false;
+		}).detach();
+	}
+
+	void ExecuteCommand(void* arg1, char* a_cmd)
+	{
+		if (!a_cmd) {
+			LogMessage("[MCF] ExecuteCommand: null cmd, forwarding");
+			return OriginalExecuteCommand(arg1, a_cmd);
+		}
+
+		std::string cmdView(a_cmd);
+		if (cmdView.empty()) {
+			LogMessage("[MCF] ExecuteCommand: empty cmd, forwarding");
+			return OriginalExecuteCommand(arg1, a_cmd);
+		}
+
+		auto args = Util::str_split(cmdView, " ", '\"');
+		if (args.empty()) {
+			LogMessage("[MCF] ExecuteCommand: no tokens, forwarding");
+			return OriginalExecuteCommand(arg1, a_cmd);
+		}
+		LogMessage(std::format("[MCF] ExecuteCommand: parsed command='{}', args={}", args[0], args.size() - 1));
+		
+		std::unique_lock l{ regLock };
+		if (auto iter = registrations.find(Util::str_tolower(args[0])); iter != registrations.end()) {
+			LogMessage(std::format("[MCF] ExecuteCommand: handler found for '{}'", args[0]));
 
 			args.erase(args.begin());
 			auto argsSSV = Util::sv_vec_to_ssv_vec(args);
+			MCF::simple_array<MCF::simple_string_view> argsArr(argsSSV);
 
-			MCF::simple_array<MCF::simple_string_view> argsArr;
-			argsArr.data = argsSSV.data();
-			argsArr.count = static_cast<uint64_t>(argsSSV.size());
-
-			g_console.Reset(fullCmd.c_str());
-
-			try {
-				callback(argsArr, fullCmd.c_str(), &g_console);
-			} catch (const std::exception& e) {
-				spdlog::error("MCF: Exception in callback: {}", e.what());
-			} catch (...) {
-				spdlog::error("MCF: Unknown exception in callback");
-			}
-
-			g_console.PrintDefault();
-			g_inHook = false;
-			return 0xFFFF;
-		} catch (const std::exception& e) {
-			spdlog::error("MCF: Hook exception: {}", e.what());
-			return passToVanilla();
-		} catch (...) {
-			spdlog::error("MCF: Hook unknown exception");
-			return passToVanilla();
-		}
-	}
-
-	// Cienki wrapper z SEH – zabezpiecza przed AV / innymi wyjątkami strukturalnymi
-	// (funkcja nie ma lokalnych obiektów z destruktorem, więc nie łamie C2712).
-	static std::uint32_t __fastcall HookedExecuteCommand(void* a_param1, void* a_param2)
-	{
-		__try {
-			return HookedExecuteCommand_Impl(a_param1, a_param2);
-		} 		__except (EXCEPTION_EXECUTE_HANDLER) {
-			spdlog::error("MCF: SEH in HookedExecuteCommand (access violation or similar), passing to vanilla");
-			g_inHook = false;
-			return g_originalFunc ? g_originalFunc(a_param1, a_param2) : 0xFFFF;
-		}
-	}
-
-	// Dla Twojej wersji gry: ładuje mapę offset→ID z Address Library i zwraca REL::ID dla podanego RVA (offset od bazy .exe).
-	// Można wywołać np. z offsetem znalezionym w IDA – wtedy zobaczysz który ID ma Address Library dla tej wersji.
-	static std::optional<std::uint64_t> GetRELIDForOffset(std::size_t a_rva)
-	{
-		try {
-			auto* o2i = REL::Offset2ID::GetSingleton();
-			if (o2i->size() == 0) {
-				o2i->load_v5();
-				if (o2i->size() == 0)
-					o2i->load_v2();
-			}
-			if (o2i->size() == 0) return std::nullopt;
-			return o2i->get_id(a_rva);
-		} catch (...) {
-			return std::nullopt;
-		}
-	}
-
-	static void InstallHooks()
-	{
-		if (g_hookInstalled) return;
-
-		spdlog::info("MCF: Installing console hook (REL::ID(65829))...");
-		try {
-			REL::Relocation<std::uintptr_t> target(REL::ID(65829));
-			const std::uintptr_t targetAddr = target.address();
-			spdlog::info("MCF: Target address = {:X}", targetAddr);
-
-			// SFSE/CommonLibSF trampoline – kopiujemy 5 bajtów (pierwsza instrukcja), potem write_jmp5.
-			auto& trampoline = REL::GetTrampoline();
-			if (trampoline.empty()) {
-				spdlog::warn("MCF: Trampoline empty (SFSE Init with trampoline=true?). Creating 128 bytes.");
-				trampoline.create(128, nullptr);
-			}
-			constexpr std::size_t kPrologue = 5;
-			void* trampMem = trampoline.allocate(kPrologue + sizeof(REL::ASM::JMP14));
-			if (!trampMem) {
-				spdlog::error("MCF: Trampoline allocate failed");
-				return;
-			}
-			std::uintptr_t trampAddr = reinterpret_cast<std::uintptr_t>(trampMem);
-			std::memcpy(trampMem, reinterpret_cast<const void*>(targetAddr), kPrologue);
-			REL::ASM::JMP14 jmpBack(targetAddr + kPrologue);
-			REL::WriteSafeData(trampAddr + kPrologue, jmpBack);
-			trampoline.write_jmp5(targetAddr, reinterpret_cast<std::uintptr_t>(&HookedExecuteCommand));
-			g_originalFunc = reinterpret_cast<ExecuteCommandFunc>(trampAddr);
-
-			g_hookInstalled = true;
-			spdlog::info("MCF: Hook installed successfully (SFSE/REL trampoline, 5-byte).");
-		} catch (const std::exception& e) {
-			spdlog::error("MCF: Exception during hook install: {}", e.what());
-		} catch (...) {
-			spdlog::error("MCF: Unknown exception during hook install");
-		}
-	}
-
-	void RegisterCommand(const char* a_name, MCF::CommandCallback a_callback)
-	{
-		if (!a_name || !a_callback) {
-			spdlog::error("MCF: RegisterCommand called with null!");
+			intfc.Reset(cmdView.c_str());
+			LogMessage(std::format("[MCF] ExecuteCommand: calling handler for '{}'", cmdView));
+			iter->second(argsArr, cmdView.c_str(), &intfc);
+			LogMessage(std::format("[MCF] ExecuteCommand: handler returned for '{}'", cmdView));
+			intfc.PrintDefault();
+			LogMessage("[MCF] ExecuteCommand: EXIT (handled)");
 			return;
 		}
 
+		LogMessage("[MCF] ExecuteCommand: no handler, forwarding");
+		return OriginalExecuteCommand(arg1, a_cmd);
+	}
+
+	void InstallHooks()
+	{
+		LogMessage("MCF: InstallHooks() STARTED");
+		LogIdDiagnostics();
+		REL::Trampoline* trampoline = nullptr;
+		if (kEnableLegacyExecuteHook || kEnableScriptResolverProbeHook || kEnableDispatcherCallsiteHook) {
+			SFSE::AllocTrampoline(64);
+			trampoline = &SFSE::GetTrampoline();
+		}
+
+		if (kEnableLegacyExecuteHook) {
+			REL::Relocation<uintptr_t> hookLoc{ REL::ID(166307), 0xD2 };
+			OriginalExecuteCommand = reinterpret_cast<ExecuteCommandFunc>(trampoline->write_call<5>(hookLoc.address(), &ExecuteCommand));
+			LogMessage("MCF: Installed command hook (1.15 logic)");
+		} else {
+			LogMessage("MCF: Execute hook disabled (stability mode)");
+		}
+
+		if (kEnableScriptResolverProbeHook) {
+			REL::Relocation<uintptr_t> resolverCallA{ REL::Offset(0xC1594E) };
+			REL::Relocation<uintptr_t> resolverCallB{ REL::Offset(0xC15A6E) };
+			OriginalScriptResolverCallA = reinterpret_cast<ScriptResolverFunc>(trampoline->write_call<5>(resolverCallA.address(), &ScriptResolverProbeHookA));
+			OriginalScriptResolverCallB = reinterpret_cast<ScriptResolverFunc>(trampoline->write_call<5>(resolverCallB.address(), &ScriptResolverProbeHookB));
+			LogMessage("MCF: Installed resolver probe hooks at RVA 0xC1594E and 0xC15A6E");
+		} else {
+			LogMessage("MCF: Resolver probe hooks disabled");
+		}
+
+		if (kEnableDispatcherCallsiteHook) {
+			REL::Relocation<uintptr_t> dispatcherCallsite{ REL::Offset(0xC14B73) };
+			OriginalDispatcherCallsite = reinterpret_cast<DispatcherCallsiteFunc>(
+				trampoline->write_call<5>(dispatcherCallsite.address(), &DispatcherCallsiteHook));
+			LogMessage("MCF: Installed dispatcher callsite hook at RVA 0xC14B73");
+		} else {
+			LogMessage("MCF: Dispatcher callsite hook disabled");
+		}
+
+		LogMessage("MCF: InstallHooks() COMPLETED");
+	}
+
+	void RegisterCommand(const char* a_name, MCF::CommandCallback a_func)
+	{
+		std::unique_lock l{ regLock };
 		std::string nameStr = Util::str_tolower(a_name);
 		if (nameStr.empty()) {
-			spdlog::error("MCF: RegisterCommand called with empty name");
 			return;
 		}
 
-		std::unique_lock<std::mutex> lock(g_regLock);
-		if (g_registrations.contains(nameStr)) {
-			spdlog::warn("MCF: Command '{}' already registered", a_name);
+		if (registrations.contains(nameStr)) {
+			LogMessage(std::format("MCF: A plugin tried to register command '{}', but that command has already been registered", a_name));
 			return;
 		}
-
-		g_registrations.insert({ nameStr, a_callback });
-		spdlog::info("MCF: Registered command: '{}'", a_name);
-		spdlog::info("MCF: Total commands: {}", g_registrations.size());
-
-		if (!g_hookInstalled) {
-			lock.unlock();
-			InstallHooks();
+		registrations.insert(std::make_pair(nameStr, a_func));
+		LogMessage(std::format("MCF: Command {} registered", a_name));
+		if (nameStr == "saf" && kEnableScriptTableInjection) {
+			InstallSafScriptCommand();
 		}
 	}
 }
 
-extern "C" __declspec(dllexport) void RegisterCommand(const char* a_name, MCF::CommandCallback a_callback)
+DLLEXPORT void RegisterCommand(const char* a_name, MCF::CommandCallback a_func)
 {
-	spdlog::info("MCF EXPORT: RegisterCommand called for '{}'", a_name ? a_name : "(null)");
-	Commands::RegisterCommand(a_name, a_callback);
+	Commands::RegisterCommand(a_name, a_func);
 }
